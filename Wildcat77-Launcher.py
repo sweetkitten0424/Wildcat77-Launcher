@@ -56,6 +56,7 @@ VANILLA_DIR = INSTALL_DIR / "vanilla"  # all args files live here
 # Mojang endpoints
 VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 ASSET_BASE_URL = "https://resources.download.minecraft.net"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # Oracle JDK ZIP
 JAVA_RUNTIME_ZIP_URL = (
@@ -516,10 +517,51 @@ def clean_dir(path):
             os.remove(full)
 
 
-def download_to_file(url: str, dest: Path):
+def download_to_file(url: str, dest: Path, timeout: int = 30, max_retries: int = 3, backoff_factor: float = 1.5):
+    """
+    Robust download helper:
+    - sends a browser-like User-Agent
+    - adds Referer for known CDNs that block non-browser clients
+    - retries transient failures with backoff
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out_f:
-        shutil.copyfileobj(resp, out_f)
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Add Referer for hosts that often block direct/automated downloads
+    if "forgecdn.net" in url or "curseforge.com" in url or "media.forgecdn.net" in url:
+        headers.setdefault("Referer", "https://www.curseforge.com/")
+    if "fabricmc.net" in url:
+        headers.setdefault("Referer", "https://fabricmc.net/")
+
+    req = urllib.request.Request(url, headers=headers)
+
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with open(dest, "wb") as out_f:
+                    shutil.copyfileobj(resp, out_f)
+                return
+        except urllib.error.HTTPError as e:
+            # If server blocks with 403 on first try, retry once after adding a Referer
+            if e.code == 403 and attempt == 0:
+                headers["Referer"] = headers.get("Referer", "https://www.google.com/")
+                req = urllib.request.Request(url, headers=headers)
+                attempt += 1
+                time.sleep(backoff_factor)
+                continue
+            raise
+        except Exception:
+            attempt += 1
+            if attempt >= max_retries:
+                raise
+            time.sleep(backoff_factor * attempt)
+            continue
 
 
 def parallel_download_files(download_tasks: list, logger, max_workers: int = MAX_PARALLEL_DOWNLOADS):
@@ -689,6 +731,7 @@ def get_curseforge_file_download_url(project_id: int, file_id: int, api_key: str
         url = f"https://api.curseforge.com/v1/mods/{project_id}/files/{file_id}"
         req = urllib.request.Request(url)
         req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", DEFAULT_USER_AGENT)
         
         # Add API key if provided
         if api_key.strip():
