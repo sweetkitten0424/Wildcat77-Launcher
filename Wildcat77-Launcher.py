@@ -324,13 +324,21 @@ def download_forge_installer(mc_version: str, logger, forge_version: str = "") -
         
         logger(f"Found Forge version {forge_version} for MC {mc_version}")
         
-        # Construct download URL
+        # Normalize forge_version: promotions_slim may return either the short build
+        # (e.g. "43.2.0") or the full label (e.g. "1.19.2-43.2.0"). Use a single
+        # `full_label` for both the maven directory and installer filename.
+        if isinstance(forge_version, str) and forge_version.startswith(f"{mc_version}-"):
+            full_label = forge_version
+        else:
+            full_label = f"{mc_version}-{forge_version}"
+
+        # Construct download URL (maven host expects the full label)
         installer_url = (
             f"https://maven.minecraftforge.net/net/minecraftforge/forge/"
-            f"{mc_version}-{forge_version}/forge-{mc_version}-{forge_version}-installer.jar"
+            f"{full_label}/forge-{full_label}-installer.jar"
         )
-        
-        installer_name = f"forge-{mc_version}-{forge_version}-installer.jar"
+
+        installer_name = f"forge-{full_label}-installer.jar"
         installer_path = loaders_dir / installer_name
         
         if installer_path.exists():
@@ -533,10 +541,13 @@ def download_to_file(url: str, dest: Path, timeout: int = 30, max_retries: int =
     }
 
     # Add Referer for hosts that often block direct/automated downloads
-    if "forgecdn.net" in url or "curseforge.com" in url or "media.forgecdn.net" in url:
+    if ("forgecdn.net" in url) or ("curseforge.com" in url) or ("media.forgecdn.net" in url):
         headers.setdefault("Referer", "https://www.curseforge.com/")
     if "fabricmc.net" in url:
         headers.setdefault("Referer", "https://fabricmc.net/")
+    if "maven.minecraftforge.net" in url or "files.minecraftforge.net" in url:
+        # maven/files host for Forge expects a browser Referer in some cases
+        headers.setdefault("Referer", "https://files.minecraftforge.net/")
 
     req = urllib.request.Request(url, headers=headers)
 
@@ -550,7 +561,11 @@ def download_to_file(url: str, dest: Path, timeout: int = 30, max_retries: int =
         except urllib.error.HTTPError as e:
             # If server blocks with 403 on first try, retry once after adding a Referer
             if e.code == 403 and attempt == 0:
-                headers["Referer"] = headers.get("Referer", "https://www.google.com/")
+                # Prefer a site-specific Referer for known hosts (Forge/file hosts)
+                if "maven.minecraftforge.net" in url or "files.minecraftforge.net" in url or "forgecdn.net" in url:
+                    headers["Referer"] = headers.get("Referer", "https://files.minecraftforge.net/")
+                else:
+                    headers["Referer"] = headers.get("Referer", "https://www.google.com/")
                 req = urllib.request.Request(url, headers=headers)
                 attempt += 1
                 time.sleep(backoff_factor)
@@ -1089,7 +1104,6 @@ def generate_java_args_from_version_json(
     substitutions = {
         "${auth_player_name}": config.get("auth_player_name", "Player"),
         "${version_name}": version_id,
-        "${game_directory}": game_dir,
         "${assets_root}": assets_root,
         "${assets_index_name}": assets_index_name,
         "${auth_uuid}": config.get("auth_uuid", "00000000-0000-0000-0000-000000000000"),
@@ -1346,11 +1360,7 @@ class MinecraftLauncherApp:
             self.open_console_window,
         ).pack(side="left", padx=5)
 
-        self._mk_header_button(
-            settings_frame,
-            "Minecraft Folder",
-            self.choose_minecraft_dir,
-        ).pack(side="left", padx=5)
+
 
         self._mk_header_button(
             settings_frame,
@@ -2378,15 +2388,7 @@ class MinecraftLauncherApp:
 
     # ----- Settings -----
 
-    def choose_minecraft_dir(self):
-        directory = filedialog.askdirectory(
-            title="Select your .minecraft folder or instance folder",
-        )
-        if not directory:
-            return
-        self.config["minecraft_dir"] = directory
-        save_config(self.config)
-        self.log(f"Minecraft directory set to: {directory}", source="LAUNCHER")
+
 
     def settings_dialog(self):
         """Open settings dialog for API keys and launcher configuration."""
@@ -2481,13 +2483,9 @@ class MinecraftLauncherApp:
             messagebox.showinfo("No modpack", "Please select a modpack first.")
             return
 
-        mc_dir = self.config.get("minecraft_dir") or ""
-        if not mc_dir or not os.path.isdir(mc_dir):
-            messagebox.showerror(
-                "Minecraft folder not set",
-                "Please set your .minecraft/instance folder in the header first.",
-            )
-            return
+        # Use the modpack folder itself as the game directory (ATLauncher-style)
+        mc_dir = str(mp_dir.resolve())
+
 
         mp_dir = Path(MODPACKS_DIR) / name
         if not mp_dir.exists():
@@ -2535,21 +2533,23 @@ class MinecraftLauncherApp:
             self.log(f"Applying modpack '{name}'...", source="LAUNCHER")
             self.root.update_idletasks()
 
-            mods_src = mp_dir / "mods"
-            mods_dst = Path(mc_dir) / "mods"
-            os.makedirs(mods_dst, exist_ok=True)
-            clean_dir(str(mods_dst))
-            copy_tree(str(mods_src), str(mods_dst))
+            # If the game directory is the same as the modpack folder, no copy is needed.
+            if Path(mc_dir).resolve() != mp_dir.resolve():
+                mods_src = mp_dir / "mods"
+                mods_dst = Path(mc_dir) / "mods"
+                os.makedirs(mods_dst, exist_ok=True)
+                clean_dir(str(mods_dst))
+                copy_tree(str(mods_src), str(mods_dst))
 
-            config_src = mp_dir / "config"
-            config_dst = Path(mc_dir) / "config"
-            os.makedirs(config_dst, exist_ok=True)
-            copy_tree(str(config_src), str(config_dst))
+                config_src = mp_dir / "config"
+                config_dst = Path(mc_dir) / "config"
+                os.makedirs(config_dst, exist_ok=True)
+                copy_tree(str(config_src), str(config_dst))
 
-            res_src = mp_dir / "resourcepacks"
-            res_dst = Path(mc_dir) / "resourcepacks"
-            os.makedirs(res_dst, exist_ok=True)
-            copy_tree(str(res_src), str(res_dst))
+                res_src = mp_dir / "resourcepacks"
+                res_dst = Path(mc_dir) / "resourcepacks"
+                os.makedirs(res_dst, exist_ok=True)
+                copy_tree(str(res_src), str(res_dst))
 
             if loader != "vanilla":
                 self.log(f"Setting up {loader.upper()} loader...", source="LAUNCHER")
@@ -2563,7 +2563,8 @@ class MinecraftLauncherApp:
                     f"Modpack '{name}' applied. Launching Minecraft with USERDIR/vanilla/{args_name}...",
                     source="LAUNCHER",
                 )
-                self._launch_with_argfile(java_exe, args_file)
+                # Pass the modpack folder as the game directory so each modpack is isolated
+                self._launch_with_argfile(java_exe, args_file, mc_dir)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply modpack or launch: {e}")
             self.log("Error while applying modpack / launching.", source="LAUNCHER")
@@ -2636,8 +2637,8 @@ class MinecraftLauncherApp:
                 )
                 self.log(f"Fabric installed. Launching...", source="LAUNCHER")
 
-            # Launch using the modified args file or vanilla args
-            self._launch_with_argfile(java_exe, args_file)
+            # Launch using the modified args file or vanilla args (pass mc_dir)
+            self._launch_with_argfile(java_exe, args_file, mc_dir)
 
         except Exception as e:
             messagebox.showerror(
@@ -2646,12 +2647,52 @@ class MinecraftLauncherApp:
             )
             self.log(f"Failed to setup {loader}.", source="LAUNCHER")
 
-    def _launch_with_argfile(self, java_exe: Path, args_file: Path):
-        """Launch Java with @<args_file> from USERDIR and stream logs to console."""
+    def _launch_with_argfile(self, java_exe: Path, args_file: Path, game_dir: str = None):
+        """Launch Java with @<args_file> from USERDIR and stream logs to console.
+
+        If `game_dir` is provided, substitute `${game_directory}` (or replace the default
+        instance path) in a temporary copy of the args file so each modpack can use its
+        own instance folder.
+        """
+        # Read the args file and substitute game directory when requested
+        args_text = args_file.read_text(encoding="utf-8")
+
+        # Determine sensible defaults
+        version_id = ""
+        if args_file.name.startswith("java_args_") and args_file.name.endswith(".txt"):
+            version_id = args_file.name[len("java_args_"):-4]
+        default_instance = str((INSTALL_DIR / "instances" / version_id).resolve()) if version_id else ""
+        cfg_mc = self.config.get("minecraft_dir", "")
+
+        # Decide on effective game_dir
+        if not game_dir:
+            game_dir = cfg_mc or default_instance
+
+        replaced = False
+        if "${game_directory}" in args_text and game_dir:
+            args_text = args_text.replace("${game_directory}", game_dir)
+            replaced = True
+        else:
+            # Replace known baked-in defaults when launching a modpack
+            if cfg_mc and cfg_mc in args_text and game_dir:
+                args_text = args_text.replace(cfg_mc, game_dir)
+                replaced = True
+            elif default_instance and default_instance in args_text and game_dir:
+                args_text = args_text.replace(default_instance, game_dir)
+                replaced = True
+
+        # If we changed the args, write a temp copy in VANILLA_DIR
+        final_args_path = args_file
+        if replaced:
+            VANILLA_DIR.mkdir(parents=True, exist_ok=True)
+            temp_name = f"{args_file.stem}__instance_{int(time.time())}.txt"
+            final_args_path = VANILLA_DIR / temp_name
+            final_args_path.write_text(args_text, encoding="utf-8")
+
         try:
-            rel_args_path = args_file.relative_to(INSTALL_DIR)
+            rel_args_path = final_args_path.relative_to(INSTALL_DIR)
         except ValueError:
-            rel_args_path = Path("vanilla") / args_file.name
+            rel_args_path = Path("vanilla") / final_args_path.name
 
         argfile_arg = f"@{rel_args_path.as_posix()}"
 
